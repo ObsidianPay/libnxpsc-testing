@@ -47,6 +47,21 @@ static int pcsc_transceive(void* vctx, const uint8_t* tx, size_t txlen,
     return NXPSC_OK;
 }
 
+// PreparePC puts the card into proximity check mode and it stays there until
+// the sequence finishes or the field drops, answering 0x0B to everything else.
+// PC/SC disconnects with SCARD_LEAVE_CARD, so without this the state survives
+// the process and poisons the next run.
+static PcscCtx* g_pcsc = nullptr;
+
+static bool reset_card()
+{
+    if (g_pcsc == nullptr) return false;
+    DWORD proto = 0;
+    LONG rc = SCardReconnect(g_pcsc->hCard, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T1,
+        SCARD_RESET_CARD, &proto);
+    return rc == SCARD_S_SUCCESS;
+}
+
 // ---- harness -------------------------------------------------------------------
 static int g_pass = 0, g_fail = 0, g_skip = 0;
 
@@ -216,7 +231,13 @@ static void run_tier1(nxpsc_card_t* card)
     rc = nxpsc_create_application_iso(card, CRUCIBLE_AID, 0x0F, 3, NXPSC_KEY_AES128,
         0xE110, reinterpret_cast<const uint8_t*>(DF_NAME), sizeof(DF_NAME) - 1);
     if (rc == NXPSC_E_CARD && nxpsc_last_status(card) == 0xDE) {
+        // a leftover from an interrupted run. the 0xDE ended the session, so
+        // take it back before trying to clear the application away
+        nxpsc_key_t picc{};
+        picc.type = NXPSC_KEY_2K3DES;
+        use_key(card, 0, &picc);
         nxpsc_delete_application(card, CRUCIBLE_AID);
+        use_key(card, 0, &picc);
         rc = nxpsc_create_application_iso(card, CRUCIBLE_AID, 0x0F, 3, NXPSC_KEY_AES128,
             0xE110, reinterpret_cast<const uint8_t*>(DF_NAME), sizeof(DF_NAME) - 1);
     }
@@ -543,28 +564,6 @@ static void run_tier1(nxpsc_card_t* card)
         use_key(card, 0, &appkey);
     }
 
-    // ---- 10. proximity check ---------------------------------------------------------------------
-    {
-        use_key(card, 0, &appkey);
-        bool mac_ok = false;
-        rc = nxpsc_proximity_check(card, &appkey, 4, &mac_ok);
-        if (rc == NXPSC_OK) {
-            report("ProximityCheck (4 rounds)", rc, card);
-            check("proximity check MAC verified", mac_ok, card);
-        }
-        else {
-            unsupported("ProximityCheck (4 rounds)", rc, card);
-            printf("       0x90 is not a documented DESFire error and the cause is\n"
-                   "       unconfirmed. enabling the proximity check is a\n"
-                   "       SetConfiguration path, so it cannot be ruled in or out\n"
-                   "       from here without a tier 4 write\n");
-            // an aborted PC exchange also refuses the next authentication until
-            // the application is selected again
-            nxpsc_select_application(card, CRUCIBLE_AID);
-            use_key(card, 0, &appkey);
-        }
-    }
-
     // ---- 11. transaction MAC file ------------------------------------------------------------------
     // ordered late: once a TMAC file exists every later commit in this
     // application wants a reader id alongside it
@@ -614,6 +613,56 @@ static void run_tier1(nxpsc_card_t* card)
             if (rc == NXPSC_OK) report("NotifyTransactionSuccess", rc, card);
             else { unsupported("NotifyTransactionSuccess", rc, card); use_key(card, 0, &appkey); }
         }
+    }
+
+    // ---- 10. proximity check ---------------------------------------------------------------------
+    // What holds on EV3, established here rather than assumed:
+    //   - PreparePC answers 0x90, not 0x00. libnxpsc used to call that an error
+    //   - it answers Option 0x01, published response time 0x0320, PPS1 0x0A,
+    //     and bit 0 of Option is what says the PPS1 byte is there
+    //   - it is application scoped. at PICC level it answers 0x0B
+    //   - it puts the card into proximity check mode, where everything else
+    //     answers 0x0B until the sequence finishes or the field drops
+    //   - the MAC construction in libnxpsc matches LogicalAccess exactly, so
+    //     the reason it does not verify is the key, not the layout. the card
+    //     MACs with its VC Proximity Key, key 0x21 of the application, which an
+    //     application only owns when it was created with specific VC keys
+    {
+        use_key(card, 0, &appkey);
+
+        uint8_t prep[32]{};
+        size_t prep_len = 0;
+        int prc = nxpsc_command(card, 0xF0, nullptr, 0, NXPSC_COMM_PLAIN,
+                                NXPSC_COMM_PLAIN, prep, sizeof(prep), &prep_len);
+        printf("       PreparePC -> %s, status 0x%02X, %zu bytes: ",
+            prc == NXPSC_OK ? "ok" : nxpsc_strerror(prc),
+            nxpsc_last_status(card), prep_len);
+        for (size_t i = 0; i < prep_len; i++) printf("%02X", prep[i]);
+        printf("\n");
+        check("PreparePC answers Option, published response time and PPS1",
+            prc == NXPSC_OK && prep_len == 4 && (prep[0] & 0x01) != 0, card);
+
+        // a second PreparePC while the card is already prepared answers 0x0B
+        check("the card is in proximity check mode and refuses other commands",
+            nxpsc_get_free_memory(card, nullptr) != NXPSC_OK
+                || nxpsc_last_status(card) == 0x0B, card);
+        check("a reset recovers the card from proximity check mode", reset_card(), card);
+
+        nxpsc_reset_channel(card);
+        nxpsc_select_application(card, CRUCIBLE_AID);
+        use_key(card, 0, &appkey);
+
+        bool mac_ok = true;
+        rc = nxpsc_proximity_check(card, &appkey, 8, &mac_ok);
+        check("the exchange completes and the MAC is reported unverified",
+            rc == NXPSC_E_AUTH && mac_ok == false, card);
+        printf("       the MAC needs the application's VC Proximity Key (0x21),\n"
+               "       not an ordinary application key\n");
+
+        reset_card();
+        nxpsc_reset_channel(card);
+        nxpsc_select_application(card, CRUCIBLE_AID);
+        use_key(card, 0, &appkey);
     }
 
     // ---- 12. key sets ----------------------------------------------------------------
@@ -701,6 +750,9 @@ int main()
         SCardReleaseContext(hCtx);
         return 1;
     }
+    g_pcsc = &ctx;
+    // a previous run may have left the card in proximity check mode
+    reset_card();
     printf("reader: %s\n\n", readers);
 
     report("crypto selftest", nxpsc_selftest(false), nullptr);
