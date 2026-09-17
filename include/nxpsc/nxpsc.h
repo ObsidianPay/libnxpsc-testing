@@ -405,11 +405,11 @@ int nxpsc_restrict_mfc_update(nxpsc_card_t *card, const uint8_t *data, size_t le
 int nxpsc_notify_transaction_success(nxpsc_card_t *card);
 
 // key sets. init, fill with nxpsc_change_key_ev2(), then finalize, then roll
-// key_set_settings is the settings byte for the new set, not a key count: the
-// number of keys and their type come from the application. EV3 accepts 0x00 and
-// refuses 0x01 with 0x9D and 0x80 with 0x9E when the application was created
-// with AppKeySetSett 0x00
-int nxpsc_init_key_set(nxpsc_card_t *card, uint8_t key_set, uint8_t key_set_settings);
+// key_type is the type of the new key set, not a key count: the number of keys
+// comes from the application. it has to match the application's own key type,
+// a set initialised as 2TDEA inside an AES application takes 2TDEA shaped
+// ChangeKeyEV2 payloads and can never be rolled
+int nxpsc_init_key_set(nxpsc_card_t *card, uint8_t key_set, nxpsc_keytype_t key_type);
 int nxpsc_finalize_key_set(nxpsc_card_t *card, uint8_t key_set, uint8_t key_set_version);
 int nxpsc_roll_key_set(nxpsc_card_t *card, uint8_t key_set);
 

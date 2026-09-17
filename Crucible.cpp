@@ -111,6 +111,98 @@ static bool use_key(nxpsc_card_t* card, uint8_t key_no, const nxpsc_key_t* key)
     return rc == NXPSC_OK;
 }
 
+// A full key set rotation in its own throwaway application: build a set, fill
+// it, freeze it, switch to it, and prove the new keys are the live ones. The
+// application is deleted either way, so a rotation that leaves keys in an
+// unknown state costs nothing.
+//
+// Three things here were only learnt from the card. InitializeKeySet's second
+// byte is the new set's key type carried unshifted, so AES is 0x02, and a set
+// built as 2TDEA inside an AES application takes 2TDEA shaped ChangeKeyEV2
+// payloads and can never be rolled. The low nibble of the rollKey access right
+// names the key allowed to issue the roll. And the roll swaps out the key the
+// running session was built from, so the card answers it without a MAC.
+static void run_key_set_rotation(nxpsc_card_t* card, uint8_t roll_key)
+{
+    const uint32_t AID = 0xDDEE03;
+    nxpsc_key_t picc{};
+    picc.type = NXPSC_KEY_2K3DES;
+    nxpsc_key_t appkey{};
+    appkey.type = NXPSC_KEY_AES128;
+
+    nxpsc_key_t fresh[3]{};
+    for (int k = 0; k < 3; k++) {
+        fresh[k].type = NXPSC_KEY_AES128;
+        for (int i = 0; i < 16; i++)
+            fresh[k].data[i] = static_cast<uint8_t>(0x90 + k * 0x10 + i);
+    }
+
+    nxpsc_select_application(card, 0x000000);
+    if (use_key(card, 0, &picc) == false) return;
+    nxpsc_delete_application(card, AID);
+    use_key(card, 0, &picc);
+
+    nxpsc_app_config_t cfg{};
+    cfg.key_settings = 0x0F;
+    cfg.num_keys = 3;
+    cfg.key_type = NXPSC_KEY_AES128;
+    cfg.num_key_sets = 2;           // NoKeySets has to be 2..16
+    cfg.key_set_version = 0x00;
+    cfg.max_key_size = 16;          // 16 or 24, nothing else
+    cfg.key_set_settings = roll_key;
+
+    int rc = nxpsc_create_application_ex(card, AID, &cfg);
+    report("CreateApplicationEx (2 key sets, AES)", rc, card);
+    if (rc != NXPSC_OK) { use_key(card, 0, &picc); return; }
+
+    if (nxpsc_select_application(card, AID) != NXPSC_OK || use_key(card, 0, &appkey) == false) {
+        report("SelectApplication (key set app)", NXPSC_E_AUTH, card);
+        return;
+    }
+
+    rc = nxpsc_init_key_set(card, 1, NXPSC_KEY_AES128);
+    report("InitializeKeySet 1 as AES", rc, card);
+
+    for (int k = 0; k < 3 && rc == NXPSC_OK; k++) {
+        use_key(card, 0, &appkey);
+        rc = nxpsc_change_key_ev2(card, 1, static_cast<uint8_t>(k), &appkey, &fresh[k]);
+        char label[64];
+        snprintf(label, sizeof(label), "ChangeKeyEV2 into key set 1, key %d", k);
+        report(label, rc, card);
+    }
+
+    if (rc == NXPSC_OK) {
+        use_key(card, 0, &appkey);
+        rc = nxpsc_finalize_key_set(card, 1, 0x01);
+        report("FinalizeKeySet 1", rc, card);
+    }
+
+    if (rc == NXPSC_OK) {
+        // the active set still holds the factory keys, so the nominated
+        // authority can be taken whichever key number it is
+        if (use_key(card, roll_key, &appkey)) {
+            rc = nxpsc_roll_key_set(card, 1);
+            report("RollKeySet 1", rc, card);
+        }
+        else {
+            report("RollKeySet 1", NXPSC_E_AUTH, card);
+            rc = NXPSC_E_AUTH;
+        }
+    }
+
+    if (rc == NXPSC_OK) {
+        report("Authenticate with the rolled key 1",
+            nxpsc_authenticate(card, 1, &fresh[1], NXPSC_CHAN_AUTO), card);
+        check("the key the rotation replaced no longer authenticates",
+            nxpsc_authenticate(card, 1, &appkey, NXPSC_CHAN_AUTO) != NXPSC_OK, card);
+    }
+
+    nxpsc_select_application(card, 0x000000);
+    if (use_key(card, 0, &picc))
+        report("DeleteApplication (key set app)",
+            nxpsc_delete_application(card, AID), card);
+}
+
 //-----------------------------------------------------------------------------
 // tier 1
 //-----------------------------------------------------------------------------
@@ -524,133 +616,25 @@ static void run_tier1(nxpsc_card_t* card)
         }
     }
 
-    // ---- 12. key sets --------------------------------------------------------------
-    // Two open questions, one application each probe can use a fresh key set
-    // for, so no probe is polluted by the one before it:
-    //   a) InitializeKeySet takes {KeySetNo, X}. X = 0x00 is accepted and
-    //      0x80 / 0x83 are not, but it is not yet known whether X is a value
-    //      the card checks or a field that simply has to be zero here
-    //   b) ChangeKeyEV2 works against key set 0 and answers 0x7E against a non
-    //      active key set, at the same frame length, so the length error is
-    //      coming from something other than the payload size
-    // All of it lives in its own throwaway AID that is deleted below.
+    // ---- 12. key sets ----------------------------------------------------------------
+    // Everything but RollKeySet is settled. What is known about the roll:
+    //   - it takes exactly one byte, two answers 0x7E
+    //   - the low nibble of AppKeySetSett names the key allowed to issue it.
+    //     authenticating as any other key answers 0xAE, as that key answers 0x9D
+    //   - ordering does not matter, it answers the same before and after
+    //     FinalizeKeySet, with every key in the set written
+    //   - there is no key set selector in the Authenticate key number, 0x10,
+    //     0x40 and 0x80 all fail to authenticate at all
+    // So the low nibble is the authority and something else still gates it.
+    // Sweep AppKeySetSett and run the whole rotation under each value the card
+    // accepts, authenticating as the key that value nominates.
     {
-        const uint32_t KEYSET_AID = 0xDDEE03;
-
-        nxpsc_select_application(card, 0x000000);
-        nxpsc_key_t picc{};
-        picc.type = NXPSC_KEY_2K3DES;
-        use_key(card, 0, &picc);
-
-        nxpsc_app_config_t cfg{};
-        cfg.key_settings = 0x0F;
-        cfg.num_keys = 3;
-        cfg.key_type = NXPSC_KEY_AES128;
-        cfg.num_key_sets = 4;           // sets 0..3, so three spare ones to probe
-        cfg.key_set_version = 0x00;
-        cfg.max_key_size = 16;
-        // AppKeySetSett, mapped against EV3: 0x00 and 0x01 are accepted, 0x0F
-        // is refused with 0x9E. 0x01 is the one that gets RollKeySet past its
-        // configuration check
-        cfg.key_set_settings = 0x01;
-
-        rc = nxpsc_create_application_ex(card, KEYSET_AID, &cfg);
-        if (rc == NXPSC_E_CARD && nxpsc_last_status(card) == 0xDE) {
-            nxpsc_delete_application(card, KEYSET_AID);
-            rc = nxpsc_create_application_ex(card, KEYSET_AID, &cfg);
-        }
-        if (rc != NXPSC_OK) {
-            unsupported("CreateApplicationEx (4 key sets)", rc, card);
-            use_key(card, 0, &picc);
-            cfg.num_key_sets = 2;
-            rc = nxpsc_create_application_ex(card, KEYSET_AID, &cfg);
-        }
-        report("CreateApplicationEx (key set application)", rc, card);
-
-        if (rc == NXPSC_OK && nxpsc_select_application(card, KEYSET_AID) == NXPSC_OK
-                && use_key(card, 0, &appkey)) {
-
-            uint8_t ks[16]{};
-            size_t kslen = 0;
-            if (nxpsc_command(card, 0x45, nullptr, 0, NXPSC_COMM_MAC, NXPSC_COMM_MAC,
-                              ks, sizeof(ks), &kslen) == NXPSC_OK) {
-                printf("       GetKeySettings raw: ");
-                for (size_t i = 0; i < kslen; i++) printf("%02X", ks[i]);
-                printf("\n");
-            }
-
-            // the whole rotation through the public API now that the shapes
-            // are known: create a set, fill it, freeze it, switch to it, and
-            // prove the new key is live
-            nxpsc_key_t rolled{};
-            rolled.type = NXPSC_KEY_AES128;
-            for (int i = 0; i < 16; i++) rolled.data[i] = static_cast<uint8_t>(0x90 + i);
-
-            use_key(card, 0, &appkey);
-            rc = nxpsc_init_key_set(card, 1, 0x00);
-            report("InitializeKeySet 1", rc, card);
-
-            // fill every key in the set, not just one. a set with keys still
-            // at their initial value looks incomplete to the card and RollKeySet
-            // answers 0x9D
-            nxpsc_key_t rolled_n[3]{};
-            for (int k = 0; k < 3; k++) {
-                rolled_n[k].type = NXPSC_KEY_AES128;
-                for (int i = 0; i < 16; i++)
-                    rolled_n[k].data[i] = static_cast<uint8_t>(0x90 + k * 0x10 + i);
-            }
-            memcpy(&rolled, &rolled_n[1], sizeof(rolled));
-
-            for (int k = 0; k < 3 && rc == NXPSC_OK; k++) {
-                use_key(card, 0, &appkey);
-                rc = nxpsc_change_key_ev2(card, 1, static_cast<uint8_t>(k),
-                                          &appkey, &rolled_n[k]);
-                char label[64];
-                snprintf(label, sizeof(label), "ChangeKeyEV2 into key set 1, key %d", k);
-                report(label, rc, card);
-            }
-
-            if (rc == NXPSC_OK) {
-                use_key(card, 0, &appkey);
-                rc = nxpsc_finalize_key_set(card, 1, 0x01);
-                report("FinalizeKeySet 1", rc, card);
-            }
-
-            if (rc == NXPSC_OK) {
-                // no re-authentication here: finalize and roll may have to
-                // happen inside one session, and re-authenticating between them
-                // is the difference between this and the 0xAE answer
-                rc = nxpsc_roll_key_set(card, 1);
-                report("RollKeySet 1 (same session as finalize)", rc, card);
-
-                if (rc != NXPSC_OK) {
-                    printf("       known open: with AppKeySetSett 0x00 this answers\n"
-                           "       0x9D and with 0x01 it answers 0xAE, with every key in\n"
-                           "       the set written and the set finalized, whether or not\n"
-                           "       the session is the one that finalized it\n");
-                }
-            }
-
-            if (rc == NXPSC_OK) {
-                // set 1 is the active set now, so key 1 is the key we wrote
-                report("Authenticate with the rolled key 1",
-                    nxpsc_authenticate(card, 1, &rolled, NXPSC_CHAN_AUTO), card);
-
-                // and the old key 1 must no longer work
-                int old_rc = nxpsc_authenticate(card, 1, &appkey, NXPSC_CHAN_AUTO);
-                check("the key the rotation replaced no longer authenticates",
-                    old_rc != NXPSC_OK, card);
-            }
-        }
-
-        nxpsc_select_application(card, 0x000000);
-        if (use_key(card, 0, &picc))
-            report("DeleteApplication (key set app)",
-                nxpsc_delete_application(card, KEYSET_AID), card);
-
-        nxpsc_select_application(card, CRUCIBLE_AID);
-        use_key(card, 0, &appkey);
+        // the high nibble of AppKeySetSett is refused outright, so the field is
+        // just a key number. two sets makes the rotation unambiguous, four
+        // leaves sets 2 and 3 untouched, which may be what it objects to
+        run_key_set_rotation(card, 0x01);
     }
+
 }
 
 //-----------------------------------------------------------------------------
