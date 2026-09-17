@@ -201,21 +201,19 @@ static void run_write_ladder(nxpsc_card_t* card)
             (rlen == 64 && memcmp(pattern, readback, 64) == 0) ? NXPSC_OK : NXPSC_E_CRYPTO,
             card);
 
-        // a plain-comm read of an enciphered file inside an EV2 session is a
-        // framing mismatch the card answers with 0x7E, and that error also ends
-        // the session. that is what the whole 0x7E cascade was, so take the
-        // session back before moving on
+        // inside the session the same read is a framing mismatch. every command
+        // has to carry the session MAC whatever the access rights say, so a bare
+        // 7 byte ReadData is a length error, and that error also ends the
+        // session. assert it, this is the behaviour the 0x7E cascade was hiding
         memset(readback, 0, sizeof(readback));
         rc = nxpsc_read_data(card, 3, 0, 64, NXPSC_COMM_PLAIN, readback, sizeof(readback), &rlen);
-        if (rc == NXPSC_OK)
-            report("cross-check enciphered write via plain read",
-                (rlen == 64 && memcmp(pattern, readback, 64) == 0) ? NXPSC_OK : NXPSC_E_CRYPTO,
-                card);
-        else
-            printf("       plain read of the enciphered file: %s (status 0x%02X: %s)\n",
+        bool refused = (rc == NXPSC_E_CARD && nxpsc_last_status(card) == 0x7E);
+        if (refused == false)
+            printf("       expected a 0x7E length error, got %s (status 0x%02X: %s)\n",
                 nxpsc_strerror(rc), nxpsc_last_status(card),
                 nxpsc_status_str(nxpsc_last_status(card)));
-            skip("cross-check via plain read", "card requires session read here");
+        report("in-session plain read of an enciphered file is refused",
+            refused ? NXPSC_OK : NXPSC_E_CRYPTO, card);
 
         report("session recovered after rejected read",
             ensure_session(card, 0, &appkey) ? NXPSC_OK : NXPSC_E_AUTH, card);
