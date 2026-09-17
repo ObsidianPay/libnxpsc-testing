@@ -297,8 +297,15 @@ typedef struct {
     // key sets, EV2 and later. 0 leaves the application without them
     uint8_t num_key_sets;           // 2 to 16
     uint8_t key_set_version;        // AKSVersion, the active set's version
-    uint8_t max_key_size;           // 8, 16 or 24
-    uint8_t key_set_settings;       // AppKeySetSett
+    uint8_t max_key_size;           // 16 or 24
+    // AppKeySetSett, the key allowed to issue nxpsc_roll_key_set(). only three
+    // bits wide, so 0 to 7, and the card refuses anything above that
+    uint8_t key_set_settings;
+
+    // the application carries its own virtual card keys rather than sharing the
+    // PICC ones. the proximity check MACs with key 0x21, so it needs this
+    bool specific_vc_keys;
+    bool specific_capability_data;
 } nxpsc_app_config_t;
 
 int nxpsc_create_application_ex(nxpsc_card_t *card, uint32_t aid,

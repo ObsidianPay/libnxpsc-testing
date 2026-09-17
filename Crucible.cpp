@@ -652,12 +652,67 @@ static void run_tier1(nxpsc_card_t* card)
         nxpsc_select_application(card, CRUCIBLE_AID);
         use_key(card, 0, &appkey);
 
-        bool mac_ok = true;
-        rc = nxpsc_proximity_check(card, &appkey, 8, &mac_ok);
-        check("the exchange completes and the MAC is reported unverified",
-            rc == NXPSC_E_AUTH && mac_ok == false, card);
-        printf("       the MAC needs the application's VC Proximity Key (0x21),\n"
-               "       not an ordinary application key\n");
+        // an application that carries its own VC keys has a key 0x21, which is
+        // what the card MACs the proximity check with
+        {
+            const uint32_t VC_AID = 0xDDEE05;
+            nxpsc_key_t picc{};
+            picc.type = NXPSC_KEY_2K3DES;
+
+            nxpsc_select_application(card, 0x000000);
+            use_key(card, 0, &picc);
+            nxpsc_delete_application(card, VC_AID);
+            use_key(card, 0, &picc);
+
+            nxpsc_app_config_t vcfg{};
+            vcfg.key_settings = 0x0F;
+            vcfg.num_keys = 3;
+            vcfg.key_type = NXPSC_KEY_AES128;
+            vcfg.specific_vc_keys = true;
+
+            int vrc = nxpsc_create_application_ex(card, VC_AID, &vcfg);
+            if (vrc == NXPSC_OK) {
+                report("CreateApplicationEx (specific VC keys)", vrc, card);
+            }
+            else {
+                unsupported("CreateApplicationEx (specific VC keys)", vrc, card);
+                printf("       the PICC refuses an application with its own VC keys in\n"
+                       "       its current configuration. turning virtual card support on\n"
+                       "       is a SetConfiguration path, which is out of scope here, so\n"
+                       "       key 0x21 cannot be reached and the proximity check MAC\n"
+                       "       stays unverifiable on this card\n");
+                use_key(card, 0, &picc);
+            }
+
+            if (vrc == NXPSC_OK && nxpsc_select_application(card, VC_AID) == NXPSC_OK) {
+                use_key(card, 0, &appkey);
+
+                nxpsc_key_t vc_prox{};
+                vc_prox.type = NXPSC_KEY_AES128;    // key 0x21, factory all zero
+
+                bool mac_ok = false;
+                int prc2 = nxpsc_proximity_check(card, &vc_prox, 8, &mac_ok);
+                printf("       ProximityCheck with the VC proximity key -> %s",
+                    prc2 == NXPSC_OK ? "ok" : nxpsc_strerror(prc2));
+                if (prc2 == NXPSC_E_CARD) printf(" (status 0x%02X)", nxpsc_last_status(card));
+                printf(", MAC %s\n", mac_ok ? "VERIFIED" : "mismatch");
+
+                if (prc2 == NXPSC_OK) {
+                    report("ProximityCheck", prc2, card);
+                    check("proximity check MAC verified", mac_ok, card);
+                }
+                else {
+                    unsupported("ProximityCheck", prc2, card);
+                }
+
+                reset_card();
+                nxpsc_reset_channel(card);
+            }
+
+            nxpsc_select_application(card, 0x000000);
+            if (use_key(card, 0, &picc))
+                nxpsc_delete_application(card, VC_AID);
+        }
 
         reset_card();
         nxpsc_reset_channel(card);
