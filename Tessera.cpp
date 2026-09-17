@@ -212,10 +212,32 @@ static void run_write_ladder(nxpsc_card_t* card)
                 (rlen == 64 && memcmp(pattern, readback, 64) == 0) ? NXPSC_OK : NXPSC_E_CRYPTO,
                 card);
         else
+            printf("       plain read of the enciphered file: %s (status 0x%02X: %s)\n",
+                nxpsc_strerror(rc), nxpsc_last_status(card),
+                nxpsc_status_str(nxpsc_last_status(card)));
             skip("cross-check via plain read", "card requires session read here");
 
         report("session recovered after rejected read",
             ensure_session(card, 0, &appkey) ? NXPSC_OK : NXPSC_E_AUTH, card);
+
+        // the same read outside a session. file 3 is CommMode.Full, but its
+        // read access right is free (0xE), and a free access right is what
+        // decides the comm mode when there is no session to frame against.
+        // selecting the application drops the session, so this is the only
+        // way the cross-check can ever work
+        nxpsc_select_application(card, SANDBOX_AID);
+        memset(readback, 0, sizeof(readback));
+        rc = nxpsc_read_data(card, 3, 0, 64, NXPSC_COMM_PLAIN, readback, sizeof(readback), &rlen);
+        if (rc == NXPSC_OK)
+            report("cross-check enciphered write via free plain read",
+                (rlen == 64 && memcmp(pattern, readback, 64) == 0) ? NXPSC_OK : NXPSC_E_CRYPTO,
+                card);
+        else
+            report("cross-check enciphered write via free plain read", rc, card);
+
+        // take the session back for the rest of the ladder
+        report("re-authenticate after unauthenticated read",
+            nxpsc_authenticate(card, 0, &appkey, NXPSC_CHAN_AUTO), card);
     }
 
     // ---- 13. backup file + commit/abort transaction --------------------------------
@@ -501,6 +523,9 @@ int main()
             printf("       %zu file(s) at PICC level\n", count);
         }
         else {
+            printf("       GetFileIDs at PICC level: %s (status 0x%02X: %s)\n",
+                nxpsc_strerror(rc), nxpsc_last_status(card),
+                nxpsc_status_str(nxpsc_last_status(card)));
             skip("GetFileIDs", "not permitted at PICC level on this card");
         }
 
