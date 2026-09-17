@@ -4,4 +4,5 @@
     <Platform Name="x86" />
   </Configurations>
   <Project Path="Tessera.vcxproj" Id="7c59ac7a-7ee0-4f49-97ab-f15babb43bdb" />
+  <Project Path="Crucible.vcxproj" Id="8d41fb6c-2a19-4b77-9c3e-5d0f21a4e6b2" />
 </Solution>
