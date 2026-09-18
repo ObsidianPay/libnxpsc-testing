@@ -742,6 +742,134 @@ static void run_tier1(nxpsc_card_t* card)
 }
 
 //-----------------------------------------------------------------------------
+// tier 2
+//-----------------------------------------------------------------------------
+// The two operations that carry real risk at PICC level, run one level down
+// where they cost nothing. Changing an application's master key is the same
+// code path as changing the PICC master key, same framing and same cryptogram,
+// and changing an application's key settings is the same command that can
+// permanently disable FormatPICC when it is aimed at the PICC.
+//
+// Everything here happens in AID 0xDDEE06, which this run creates and deletes.
+// A key left at an unknown value or a settings byte frozen solid is undone by
+// DeleteApplication under the PICC master key, so the failure mode is a wasted
+// application rather than a wasted card.
+static void run_tier2(nxpsc_card_t* card)
+{
+    const uint32_t TIER2_AID = 0xDDEE06;
+
+    nxpsc_key_t picc{};
+    picc.type = NXPSC_KEY_2K3DES;
+    nxpsc_key_t appkey{};
+    appkey.type = NXPSC_KEY_AES128;      // factory all zero
+
+    nxpsc_key_t newkey{};
+    newkey.type = NXPSC_KEY_AES128;
+    for (int i = 0; i < 16; i++) newkey.data[i] = static_cast<uint8_t>(0xB0 + i);
+
+    nxpsc_select_application(card, 0x000000);
+    if (use_key(card, 0, &picc) == false) {
+        report("Authenticate PICC for tier 2", NXPSC_E_AUTH, card);
+        return;
+    }
+    nxpsc_delete_application(card, TIER2_AID);
+    use_key(card, 0, &picc);
+
+    int rc = nxpsc_create_application(card, TIER2_AID, 0x0F, 3, NXPSC_KEY_AES128);
+    report("CreateApplication (tier 2 sandbox)", rc, card);
+    if (rc != NXPSC_OK) { use_key(card, 0, &picc); return; }
+
+    if (nxpsc_select_application(card, TIER2_AID) != NXPSC_OK || use_key(card, 0, &appkey) == false) {
+        report("SelectApplication (tier 2 sandbox)", NXPSC_E_AUTH, card);
+        return;
+    }
+
+    // ---- the application master key, the rehearsal for the PICC one ------------
+    // key 0 while authenticated as key 0 is the same key case: no XOR against
+    // the old key, no second CRC, and the session does not survive it
+    rc = nxpsc_change_key(card, 0, &appkey, &newkey);
+    report("ChangeKey on the application master key", rc, card);
+
+    if (rc == NXPSC_OK) {
+        check("the old master key no longer authenticates",
+            nxpsc_authenticate(card, 0, &appkey, NXPSC_CHAN_AUTO) != NXPSC_OK, card);
+
+        rc = nxpsc_authenticate(card, 0, &newkey, NXPSC_CHAN_AUTO);
+        report("Authenticate with the new master key", rc, card);
+
+        if (rc == NXPSC_OK) {
+            rc = nxpsc_change_key(card, 0, &newkey, &appkey);
+            report("ChangeKey back to the factory master key", rc, card);
+            if (rc == NXPSC_OK) {
+                report("Authenticate with the restored master key",
+                    nxpsc_authenticate(card, 0, &appkey, NXPSC_CHAN_AUTO), card);
+            }
+        }
+    }
+
+    // ---- key settings, read back rather than assumed ---------------------------
+    uint8_t settings = 0;
+    uint8_t num_keys = 0;
+    nxpsc_keytype_t ktype = NXPSC_KEY_DES;
+
+    use_key(card, 0, &appkey);
+    rc = nxpsc_get_key_settings(card, &settings, &num_keys, &ktype);
+    report("GetKeySettings", rc, card);
+    check("the application reports what it was created with",
+        rc == NXPSC_OK && settings == 0x0F && num_keys == 3
+        && ktype == NXPSC_KEY_AES128, card);
+
+    // 0x0B clears bit 2, so create and delete need the master key. bit 3 stays
+    // set so the settings can still be changed, and bit 0 stays set so the
+    // master key can still be changed. both of those are the bits that matter
+    use_key(card, 0, &appkey);
+    rc = nxpsc_change_key_settings(card, 0x0B);
+    report("ChangeKeySettings to 0x0B", rc, card);
+
+    if (rc == NXPSC_OK) {
+        use_key(card, 0, &appkey);
+        rc = nxpsc_get_key_settings(card, &settings, nullptr, nullptr);
+        check("the card reports the settings it was given",
+            rc == NXPSC_OK && settings == 0x0B, card);
+
+        use_key(card, 0, &appkey);
+        rc = nxpsc_change_key_settings(card, 0x0F);
+        report("ChangeKeySettings back to 0x0F", rc, card);
+
+        use_key(card, 0, &appkey);
+        rc = nxpsc_get_key_settings(card, &settings, nullptr, nullptr);
+        check("the restore took", rc == NXPSC_OK && settings == 0x0F, card);
+    }
+
+    // ---- prove the lockout is real, somewhere it can be thrown away ------------
+    // clearing bit 3 freezes the settings. at PICC level this is the bit that
+    // can cost FormatPICC for good, so it is worth knowing it does what the
+    // data sheet says rather than taking it on trust
+    use_key(card, 0, &appkey);
+    rc = nxpsc_change_key_settings(card, 0x07);
+    report("ChangeKeySettings to 0x07, freezing the settings", rc, card);
+
+    if (rc == NXPSC_OK) {
+        use_key(card, 0, &appkey);
+        int frozen = nxpsc_change_key_settings(card, 0x0F);
+        check("a frozen settings byte refuses any further change",
+            frozen != NXPSC_OK, card);
+        printf("       further change answered %s", nxpsc_strerror(frozen));
+        if (frozen == NXPSC_E_CARD)
+            printf(" (status 0x%02X: %s)", nxpsc_last_status(card),
+                nxpsc_status_str(nxpsc_last_status(card)));
+        printf("\n       this is the bit that would cost FormatPICC at PICC level\n");
+    }
+
+    // the application is unrecoverable now, which is exactly why it is one
+    nxpsc_select_application(card, 0x000000);
+    if (use_key(card, 0, &picc)) {
+        report("DeleteApplication undoes a frozen application",
+            nxpsc_delete_application(card, TIER2_AID), card);
+    }
+}
+
+//-----------------------------------------------------------------------------
 // offline helpers, no card involved
 //-----------------------------------------------------------------------------
 static void run_offline(void)
@@ -854,6 +982,7 @@ int main()
 
     if (rc == NXPSC_OK) {
         run_tier1(card);
+        run_tier2(card);
 
         // tear the sandbox down whatever happened inside it
         nxpsc_select_application(card, 0x000000);
