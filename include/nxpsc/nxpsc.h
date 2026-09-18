@@ -427,6 +427,25 @@ int nxpsc_proximity_check(nxpsc_card_t *card, const nxpsc_key_t *pc_key, uint8_t
                           bool *mac_ok);
 
 // SetConfiguration wrappers
+//
+// Option 0x00 is a single byte carrying all four flags at once, so every call
+// writes all of them and there is no way to change one and leave the rest. Read
+// the card first and pass back what it already had for the ones you do not mean
+// to touch.
+//
+// Disabling format and enabling random UID are one way on most cards. There is
+// no undo and no second attempt, so read the card manual before sending either
+// to a production batch.
+typedef struct {
+    bool disable_format;        // FormatPICC is refused from then on
+    bool random_uid;            // the PICC answers a fresh UID on every select
+    bool pc_mandatory;          // a proximity check is required before use
+    bool auth_vc_mandatory;     // virtual card authentication is required
+} nxpsc_picc_config_t;
+
+int nxpsc_set_picc_config_ex(nxpsc_card_t *card, const nxpsc_picc_config_t *config);
+// the two flag form, kept for callers that already use it. it writes zero into
+// the other two flags, so prefer nxpsc_set_picc_config_ex()
 int nxpsc_set_picc_config(nxpsc_card_t *card, bool disable_format, bool random_uid);
 int nxpsc_set_default_key(nxpsc_card_t *card, const nxpsc_key_t *key);
 int nxpsc_set_ats(nxpsc_card_t *card, const uint8_t *ats, size_t len);
