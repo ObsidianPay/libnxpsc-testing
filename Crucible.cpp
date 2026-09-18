@@ -113,6 +113,7 @@ static void nxpsc_crc32_helper(const uint8_t* data, size_t len, uint8_t* out)
 }
 
 static const uint32_t CRUCIBLE_AID = 0xDDEE02;
+static nxpsc_key_t picc_key_for_tier1;      // factory 2K3DES, all zero
 static const char DF_NAME[] = "nxpsc.crucible";
 
 // Always authenticate, never assume the running session is on the key we want.
@@ -224,6 +225,7 @@ static void run_key_set_rotation(nxpsc_card_t* card, uint8_t roll_key)
 static void run_tier1(nxpsc_card_t* card)
 {
     int rc;
+    picc_key_for_tier1.type = NXPSC_KEY_2K3DES;
     nxpsc_key_t appkey{};
     appkey.type = NXPSC_KEY_AES128;      // factory all-zero app keys
 
@@ -244,10 +246,22 @@ static void run_tier1(nxpsc_card_t* card)
     report("CreateApplicationISO (fid 0xE110, df name)", rc, card);
     if (rc != NXPSC_OK) return;
 
-    // GetDFNames reports what the card stored for it
+    // GetDFNames reports what the card stored for it. It has to go out with no
+    // session open: on EV1 the card answers the first continuation frame of the
+    // chained response with 0xC1 and disables itself for good. SelectApplication
+    // is what ends the session on the card, so select the PICC again first and
+    // take the session back afterwards.
     {
         nxpsc_app_t apps[8]{};
         size_t count = 0;
+
+        nxpsc_key_t picc{};
+        picc.type = NXPSC_KEY_2K3DES;
+        nxpsc_select_application(card, 0x000000);
+
+        check("the library refuses GetDFNames while a session is open",
+            nxpsc_is_authenticated(card) == false, card);
+
         rc = nxpsc_get_df_names(card, apps, 8, &count);
         if (rc == NXPSC_OK) {
             report("GetDFNames", rc, card);
@@ -265,6 +279,8 @@ static void run_tier1(nxpsc_card_t* card)
             unsupported("GetDFNames", rc, card);
         }
     }
+
+    use_key(card, 0, &picc_key_for_tier1);
 
     rc = nxpsc_select_application(card, CRUCIBLE_AID);
     report("SelectApplication (crucible)", rc, card);
