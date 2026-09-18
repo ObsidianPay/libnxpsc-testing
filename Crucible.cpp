@@ -791,8 +791,16 @@ static void run_tier2(nxpsc_card_t* card)
     report("ChangeKey on the application master key", rc, card);
 
     if (rc == NXPSC_OK) {
-        check("the old master key no longer authenticates",
-            nxpsc_authenticate(card, 0, &appkey, NXPSC_CHAN_AUTO) != NXPSC_OK, card);
+        // not merely "did not succeed": a transport glitch would satisfy that
+        // too, and this is the assertion tier 3 leans on against the PICC
+        // master key, where "did the old key really stop working" is the
+        // question you most need a trustworthy answer to
+        int old_rc = nxpsc_authenticate(card, 0, &appkey, NXPSC_CHAN_AUTO);
+        if (old_rc != NXPSC_E_AUTH && old_rc != NXPSC_E_CARD)
+            printf("       expected the card to reject the old key, got %s\n",
+                nxpsc_strerror(old_rc));
+        check("the old master key is rejected by the card",
+            old_rc == NXPSC_E_AUTH || old_rc == NXPSC_E_CARD, card);
 
         rc = nxpsc_authenticate(card, 0, &newkey, NXPSC_CHAN_AUTO);
         report("Authenticate with the new master key", rc, card);
@@ -870,6 +878,171 @@ static void run_tier2(nxpsc_card_t* card)
 }
 
 //-----------------------------------------------------------------------------
+// tier 3
+//-----------------------------------------------------------------------------
+// The PICC master key and the PICC key settings. Nothing here has a
+// DeleteApplication behind it: the whole card is the container. It only runs
+// when asked for with --tier3.
+//
+// What makes it survivable rather than merely risky:
+//   - it refuses to start unless the factory PICC master key authenticates, so
+//     the key it is about to replace is one we know
+//   - the replacement is a constant in this file, printed if anything goes
+//     wrong, so a card left holding it is recoverable by hand
+//   - it refuses to start unless the settings say the master key and the
+//     settings themselves are both still changeable, because those two bits
+//     are what makes anything here undoable
+//   - it never clears those two bits. Everything it writes keeps them set, and
+//     that is checked before sending rather than trusted to the arithmetic
+//   - every step is read back from the card rather than assumed
+//
+// Not here, and not anywhere in this program: SetConfiguration. Disabling
+// FormatPICC or turning on random UID is one way and would cost the card.
+static const uint8_t TIER3_NEW_PICC_KEY[16] = {
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
+};
+
+static void tier3_print_key(const char* what)
+{
+    printf("       %s: ", what);
+    for (size_t i = 0; i < sizeof(TIER3_NEW_PICC_KEY); i++)
+        printf("%02X", TIER3_NEW_PICC_KEY[i]);
+    printf("\n");
+}
+
+static void run_tier3(nxpsc_card_t* card)
+{
+    printf("\n---- tier 3: the PICC master key and PICC key settings ----\n");
+
+    nxpsc_key_t factory{};
+    factory.type = NXPSC_KEY_2K3DES;     // all zero
+
+    // the replacement has two different halves, so unlike the factory key it is
+    // a real 2TDEA key rather than a DES one. that exercises both sides of the
+    // degraded key rule in one pass
+    nxpsc_key_t replacement{};
+    replacement.type = NXPSC_KEY_2K3DES;
+    memcpy(replacement.data, TIER3_NEW_PICC_KEY, sizeof(TIER3_NEW_PICC_KEY));
+
+    // ---- preconditions ---------------------------------------------------------
+    int rc = nxpsc_select_application(card, 0x000000);
+    report("SelectApplication PICC", rc, card);
+    if (rc != NXPSC_OK) return;
+
+    rc = nxpsc_authenticate(card, 0, &factory, NXPSC_CHAN_AUTO);
+    report("Authenticate with the factory PICC master key", rc, card);
+    if (rc != NXPSC_OK) {
+        printf("       the current PICC master key is not the factory one, so the\n"
+               "       key about to be replaced is unknown. stopping\n");
+        return;
+    }
+
+    uint8_t original = 0;
+    rc = nxpsc_get_key_settings(card, &original, nullptr, nullptr);
+    report("GetKeySettings at PICC level", rc, card);
+    if (rc != NXPSC_OK) return;
+    printf("       PICC key settings are 0x%02X\n", original);
+
+    // bit 0 is "the master key can be changed", bit 3 is "the settings can be
+    // changed". without both, nothing below could be undone
+    bool undoable = (original & 0x01) != 0 && (original & 0x08) != 0;
+    check("the master key and the settings are both still changeable", undoable, card);
+    if (undoable == false) {
+        printf("       0x%02X has one of them already cleared. stopping\n", original);
+        return;
+    }
+
+    // ---- A. the PICC key settings ----------------------------------------------
+    // clear bit 2 only, so create and delete need the master key. bits 0 and 3
+    // stay set, and that is asserted rather than assumed
+    uint8_t tightened = (uint8_t)(original & ~0x04u);
+    bool safe_value = (tightened & 0x01) != 0 && (tightened & 0x08) != 0;
+    check("the value about to be written keeps both undo bits", safe_value, card);
+
+    if (safe_value) {
+        rc = nxpsc_change_key_settings(card, tightened);
+        report("ChangeKeySettings at PICC level", rc, card);
+
+        if (rc == NXPSC_OK) {
+            uint8_t seen = 0;
+            nxpsc_authenticate(card, 0, &factory, NXPSC_CHAN_AUTO);
+            rc = nxpsc_get_key_settings(card, &seen, nullptr, nullptr);
+            check("the card reports the settings it was given",
+                rc == NXPSC_OK && seen == tightened, card);
+
+            nxpsc_authenticate(card, 0, &factory, NXPSC_CHAN_AUTO);
+            rc = nxpsc_change_key_settings(card, original);
+            report("ChangeKeySettings back to what it was", rc, card);
+
+            nxpsc_authenticate(card, 0, &factory, NXPSC_CHAN_AUTO);
+            rc = nxpsc_get_key_settings(card, &seen, nullptr, nullptr);
+            check("the PICC key settings are back to their original value",
+                rc == NXPSC_OK && seen == original, card);
+        }
+    }
+
+    // ---- B. the PICC master key ------------------------------------------------
+    rc = nxpsc_authenticate(card, 0, &factory, NXPSC_CHAN_AUTO);
+    if (rc != NXPSC_OK) {
+        report("Authenticate before the master key change", rc, card);
+        return;
+    }
+
+    rc = nxpsc_change_key(card, 0, &factory, &replacement);
+    report("ChangeKey on the PICC master key", rc, card);
+
+    if (rc != NXPSC_OK) {
+        // the card either refused it or carried it out without saying so, and
+        // those need telling apart before anything else happens
+        int still = nxpsc_authenticate(card, 0, &factory, NXPSC_CHAN_AUTO);
+        check("the factory key still works, so nothing was changed",
+            still == NXPSC_OK, card);
+        if (still != NXPSC_OK) {
+            printf("       the change was reported as failed but the factory key no\n"
+                   "       longer works. the card most likely holds this key now:\n");
+            tier3_print_key("key");
+        }
+        return;
+    }
+
+    int old_rc = nxpsc_authenticate(card, 0, &factory, NXPSC_CHAN_AUTO);
+    check("the factory key is rejected by the card",
+        old_rc == NXPSC_E_AUTH || old_rc == NXPSC_E_CARD, card);
+
+    rc = nxpsc_authenticate(card, 0, &replacement, NXPSC_CHAN_AUTO);
+    report("Authenticate with the new PICC master key", rc, card);
+    if (rc != NXPSC_OK) {
+        printf("       neither key authenticates. the card should hold this one:\n");
+        tier3_print_key("key");
+        return;
+    }
+
+    rc = nxpsc_change_key(card, 0, &replacement, &factory);
+    report("ChangeKey back to the factory PICC master key", rc, card);
+    if (rc != NXPSC_OK) {
+        printf("       the card is left holding the replacement key:\n");
+        tier3_print_key("key");
+        return;
+    }
+
+    rc = nxpsc_authenticate(card, 0, &factory, NXPSC_CHAN_AUTO);
+    report("Authenticate with the restored factory key", rc, card);
+    if (rc != NXPSC_OK) {
+        printf("       the restore was reported as done but the factory key does not\n"
+               "       work. try this one:\n");
+        tier3_print_key("key");
+        return;
+    }
+
+    // and the card is still exactly as usable as it was before any of this
+    uint8_t seen = 0;
+    rc = nxpsc_get_key_settings(card, &seen, nullptr, nullptr);
+    check("the card is back exactly where it started",
+        rc == NXPSC_OK && seen == original, card);
+}
+
+//-----------------------------------------------------------------------------
 // offline helpers, no card involved
 //-----------------------------------------------------------------------------
 static void run_offline(void)
@@ -911,8 +1084,21 @@ static void run_offline(void)
 }
 
 //-----------------------------------------------------------------------------
-int main()
+int main(int argc, char** argv)
 {
+    // tier 3 touches the PICC master key and the PICC key settings, which have
+    // nothing behind them to undo a mistake. an ordinary run never goes there
+    bool want_tier3 = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--tier3") == 0) {
+            want_tier3 = true;
+        }
+        else {
+            printf("usage: %s [--tier3]\n", argv[0]);
+            return 1;
+        }
+    }
+
     SCARDCONTEXT hCtx;
     if (SCardEstablishContext(SCARD_SCOPE_SYSTEM, nullptr, nullptr, &hCtx) != SCARD_S_SUCCESS) {
         printf("failed to establish PC/SC context\n");
@@ -983,6 +1169,13 @@ int main()
     if (rc == NXPSC_OK) {
         run_tier1(card);
         run_tier2(card);
+        if (want_tier3) {
+            run_tier3(card);
+        }
+        else {
+            printf("\n(tier 3 not run, pass --tier3 to include the PICC master key\n"
+                   " and PICC key settings)\n");
+        }
 
         // tear the sandbox down whatever happened inside it
         nxpsc_select_application(card, 0x000000);
