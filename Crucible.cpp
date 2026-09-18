@@ -894,6 +894,165 @@ static void run_tier2(nxpsc_card_t* card)
 }
 
 //-----------------------------------------------------------------------------
+// the EV1 secure channel
+//-----------------------------------------------------------------------------
+// Everything above runs on the D40 channel, because the factory PICC key is
+// 2TDEA, or on EV2, because the application keys are AES. That leaves the EV1
+// channel untouched, and it is the fiddliest one in the library: the CMAC
+// chains the IV across commands, enciphered payloads carry a CRC32 over
+// cmd || data rather than a CRC16 over data, and ChangeKey adds a second CRC32
+// over the new key.
+//
+// An EV3 still answers AuthenticateISO, so the whole channel can be exercised
+// on the card in hand by asking for it rather than letting AUTO pick. Nothing
+// here leaves the throwaway application, and the PICC part is read only.
+static void run_ev1_channel(nxpsc_card_t* card)
+{
+    const uint32_t EV1_AID = 0xDDEE07;
+
+    nxpsc_key_t picc{};
+    picc.type = NXPSC_KEY_2K3DES;       // factory, all zero
+
+    // ---- the PICC key over AuthenticateISO rather than the legacy 0x0A --------
+    int rc = nxpsc_select_application(card, 0x000000);
+    if (rc != NXPSC_OK) {
+        report("SelectApplication PICC for the EV1 channel", rc, card);
+        return;
+    }
+
+    rc = nxpsc_authenticate(card, 0, &picc, NXPSC_CHAN_EV1);
+    report("Authenticate on the EV1 channel (AuthenticateISO)", rc, card);
+
+    if (rc == NXPSC_OK) {
+        // a MACed answer, which is decode_ev1 verifying a CMAC and advancing
+        // the IV with it
+        uint8_t version = 0xFF;
+        rc = nxpsc_get_key_version(card, 0, &version);
+        report("GetKeyVersion over the EV1 channel", rc, card);
+
+        // the IV carries from one command to the next, so a second MACed
+        // command only verifies if the first advanced it correctly
+        uint32_t freemem = 0;
+        rc = nxpsc_get_free_memory(card, &freemem);
+        report("a second MACed command, so the chained IV held", rc, card);
+
+        // and an enciphered answer, which is the CRC32 over data || status
+        uint8_t uid[16]{};
+        size_t uid_len = 0;
+        rc = nxpsc_get_card_uid(card, uid, sizeof(uid), &uid_len);
+        report("GetCardUID enciphered over the EV1 channel", rc, card);
+        check("GetCardUID came back seven bytes over the EV1 channel",
+            rc == NXPSC_OK && uid_len == 7, card);
+    }
+
+    // ---- an application whose keys are 3TDEA, which AUTO routes to EV1 --------
+    nxpsc_key_t tdes3{};
+    tdes3.type = NXPSC_KEY_3K3DES;      // all zero
+
+    use_key(card, 0, &picc);
+    nxpsc_delete_application(card, EV1_AID);
+    use_key(card, 0, &picc);
+
+    rc = nxpsc_create_application(card, EV1_AID, 0x0F, 2, NXPSC_KEY_3K3DES);
+    report("CreateApplication with 3TDEA keys", rc, card);
+    if (rc != NXPSC_OK) {
+        use_key(card, 0, &picc);
+        return;
+    }
+
+    if (nxpsc_select_application(card, EV1_AID) != NXPSC_OK) {
+        report("SelectApplication (EV1 sandbox)", NXPSC_E_CARD, card);
+        return;
+    }
+
+    rc = nxpsc_authenticate(card, 0, &tdes3, NXPSC_CHAN_AUTO);
+    report("Authenticate with a 3TDEA key, AUTO picking EV1", rc, card);
+    check("AUTO chose the EV1 channel for a 3TDEA key",
+        rc == NXPSC_OK && nxpsc_active_channel(card) == NXPSC_CHAN_EV1, card);
+
+    if (rc == NXPSC_OK) {
+        nxpsc_access_t acc{};
+        acc.read = 0x00;
+        acc.write = 0x00;
+        acc.read_write = 0x00;
+        acc.change = 0x00;
+
+        static const uint8_t pattern[32] = {
+            0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78,
+            0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0,
+            0xDE, 0xAD, 0xBE, 0xEF, 0x13, 0x37, 0xC0, 0xDE,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
+        };
+        uint8_t back[64]{};
+        size_t back_len = 0;
+
+        rc = nxpsc_create_std_file(card, 1, 0x0000, NXPSC_COMM_MAC, &acc, 32);
+        report("CreateStdFile over the EV1 channel", rc, card);
+
+        if (rc == NXPSC_OK) {
+            // MACed write and read back, so encode_ev1 and decode_ev1 agree
+            // with the card in both directions
+            rc = nxpsc_write_data(card, 1, 0, pattern, sizeof(pattern), NXPSC_COMM_MAC);
+            report("WriteData MAC over the EV1 channel", rc, card);
+
+            use_key(card, 0, &tdes3);
+            rc = nxpsc_read_data(card, 1, 0, sizeof(pattern), NXPSC_COMM_MAC,
+                                 back, sizeof(back), &back_len);
+            report("ReadData MAC over the EV1 channel", rc, card);
+            check("the MACed round trip came back unchanged",
+                rc == NXPSC_OK && back_len == sizeof(pattern)
+                && memcmp(back, pattern, sizeof(pattern)) == 0, card);
+        }
+
+        // and the enciphered path, which is the CRC32 the D40 channel does not use
+        use_key(card, 0, &tdes3);
+        rc = nxpsc_create_std_file(card, 2, 0x0000, NXPSC_COMM_FULL, &acc, 32);
+        report("CreateStdFile enciphered over the EV1 channel", rc, card);
+
+        if (rc == NXPSC_OK) {
+            use_key(card, 0, &tdes3);
+            rc = nxpsc_write_data(card, 2, 0, pattern, sizeof(pattern), NXPSC_COMM_FULL);
+            report("WriteData enciphered over the EV1 channel", rc, card);
+
+            use_key(card, 0, &tdes3);
+            memset(back, 0, sizeof(back));
+            rc = nxpsc_read_data(card, 2, 0, sizeof(pattern), NXPSC_COMM_FULL,
+                                 back, sizeof(back), &back_len);
+            report("ReadData enciphered over the EV1 channel", rc, card);
+            check("the enciphered round trip came back unchanged",
+                rc == NXPSC_OK && back_len == sizeof(pattern)
+                && memcmp(back, pattern, sizeof(pattern)) == 0, card);
+        }
+
+        // ChangeKey on EV1 is its own shape: CRC32 over cmd || keyno || payload
+        // and a second CRC32 over the new key, which no other channel sends
+        nxpsc_key_t fresh{};
+        fresh.type = NXPSC_KEY_3K3DES;
+        for (int i = 0; i < 24; i++) fresh.data[i] = static_cast<uint8_t>(0x40 + i);
+
+        use_key(card, 0, &tdes3);
+        rc = nxpsc_change_key(card, 1, &tdes3, &fresh);
+        report("ChangeKey on app key 1 over the EV1 channel", rc, card);
+
+        if (rc == NXPSC_OK) {
+            rc = nxpsc_authenticate(card, 1, &fresh, NXPSC_CHAN_AUTO);
+            report("Authenticate with the changed 3TDEA key", rc, card);
+
+            if (use_key(card, 0, &tdes3)) {
+                rc = nxpsc_change_key(card, 1, &fresh, &tdes3);
+                report("ChangeKey back over the EV1 channel", rc, card);
+            }
+        }
+    }
+
+    nxpsc_select_application(card, 0x000000);
+    if (use_key(card, 0, &picc)) {
+        report("DeleteApplication (EV1 sandbox)",
+            nxpsc_delete_application(card, EV1_AID), card);
+    }
+}
+
+//-----------------------------------------------------------------------------
 // tier 3
 //-----------------------------------------------------------------------------
 // The PICC master key and the PICC key settings. Nothing here has a
@@ -1184,6 +1343,7 @@ int main(int argc, char** argv)
 
     if (rc == NXPSC_OK) {
         run_tier1(card);
+        run_ev1_channel(card);
         run_tier2(card);
         if (want_tier3) {
             run_tier3(card);
