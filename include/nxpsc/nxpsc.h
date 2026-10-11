@@ -32,6 +32,14 @@ extern "C" {
 #define NXPSC_VERSION_MINOR     1
 #define NXPSC_VERSION_PATCH     0
 
+#define NXPSC_STRINGIFY_(x)     #x
+#define NXPSC_STRINGIFY(x)      NXPSC_STRINGIFY_(x)
+// version of the headers being compiled against. nxpsc_version_string() gives
+// the one the library itself was built from, the two differ on a stale link
+#define NXPSC_VERSION_STRING    NXPSC_STRINGIFY(NXPSC_VERSION_MAJOR) "." \
+                                NXPSC_STRINGIFY(NXPSC_VERSION_MINOR) "." \
+                                NXPSC_STRINGIFY(NXPSC_VERSION_PATCH)
+
 #define NXPSC_MAX_KEY_SIZE      32
 #define NXPSC_MAX_APDU          264
 // biggest supported reassembled response, a file read is chunked above this
@@ -213,6 +221,9 @@ typedef struct {
 int nxpsc_open(const nxpsc_transport_t *transport, nxpsc_card_t **out);
 void nxpsc_close(nxpsc_card_t *card);
 void nxpsc_reset_channel(nxpsc_card_t *card);
+
+// "major.minor.patch" the library itself was compiled with, never NULL
+const char *nxpsc_version_string(void);
 
 const char *nxpsc_strerror(int rc);
 // status byte of the last card response, and its text
